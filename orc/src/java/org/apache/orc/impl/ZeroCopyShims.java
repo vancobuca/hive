@@ -76,9 +76,7 @@ class ZeroCopyShims {
     }
 
     @Override
-    public final void close() throws IOException {
-      this.in.close();
-    }
+    public final void close() throws IOException { }
   }
 
   public static HadoopShims.ZeroCopyReaderShim getZeroCopyReader(FSDataInputStream in,
