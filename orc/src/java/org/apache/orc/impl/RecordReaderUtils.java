@@ -23,7 +23,9 @@ import java.util.ArrayList;
 import java.util.List;
 import java.util.Map;
 import java.util.TreeMap;
+import java.util.concurrent.ConcurrentHashMap;
 
+import com.google.common.annotations.VisibleForTesting;
 import com.google.common.collect.Lists;
 import org.apache.commons.lang.builder.HashCodeBuilder;
 import org.apache.hadoop.fs.FSDataInputStream;
@@ -39,6 +41,9 @@ import org.apache.orc.OrcProto;
 
 import com.google.common.collect.ComparisonChain;
 import org.apache.orc.StripeInformation;
+
+import io.netty.buffer.ByteBuf;
+import io.netty.buffer.UnpooledByteBufAllocator;
 
 /**
  * Stateless methods shared between RecordReaderImpl and EncodedReaderImpl.
@@ -504,6 +509,24 @@ public class RecordReaderUtils {
   // this is an implementation copied from ElasticByteBufferPool in hadoop-2,
   // which lacks a clear()/clean() operation
   public final static class ByteBufferAllocatorPool implements HadoopShims.ByteBufferPoolShim {
+    private static final class ByteBufferWrapper {
+      private final ByteBuffer byteBuffer;
+      ByteBufferWrapper(ByteBuffer byteBuffer) {
+        this.byteBuffer = byteBuffer;
+      }
+      @Override
+      public boolean equals(Object rhs) {
+        return (rhs instanceof ByteBufferWrapper) && (this.byteBuffer == ((ByteBufferWrapper) rhs).byteBuffer);
+      }
+      @Override
+      public int hashCode() {
+        return System.identityHashCode(byteBuffer);
+      }
+    }
+    @VisibleForTesting
+    final Map<ByteBufferWrapper, ByteBuf> directBufMap = new ConcurrentHashMap<>();
+    static final int DIRECT_ROUND_UP_THRESHOLD = 16 * 1024 * 1024;
+
     private static final class Key implements Comparable<Key> {
       private final int capacity;
       private final long insertionGeneration;
@@ -554,8 +577,29 @@ public class RecordReaderUtils {
       directBuffers.clear();
     }
 
+    private static int nextPowerOfTwo(int val) {
+      if (val == 0 || val == 1) {
+        return val + 1;
+      }
+      int highestBit = Integer.highestOneBit(val);
+      if (highestBit == val) {
+        return val;
+      } else {
+        return highestBit << 1;
+      }
+    }
+
     @Override
     public ByteBuffer getBuffer(boolean direct, int length) {
+      if (direct) {
+        final int requestSize = length < DIRECT_ROUND_UP_THRESHOLD
+                ? nextPowerOfTwo(length)
+                : length;
+        ByteBuf buf = UnpooledByteBufAllocator.DEFAULT.directBuffer(requestSize, requestSize);
+        ByteBuffer retBuf = buf.nioBuffer(0, length);
+        directBufMap.put(new ByteBufferWrapper(retBuf), buf);
+        return retBuf;
+      }
       TreeMap<Key, ByteBuffer> tree = getBufferTree(direct);
       Map.Entry<Key, ByteBuffer> entry = tree.ceilingEntry(new Key(length, 0));
       if (entry == null) {
@@ -568,6 +612,13 @@ public class RecordReaderUtils {
 
     @Override
     public void putBuffer(ByteBuffer buffer) {
+      if (buffer.isDirect()) {
+        ByteBuf buf = directBufMap.remove(new ByteBufferWrapper(buffer));
+        if (buf != null) {
+          buf.release();
+        }
+        return;
+      }
       TreeMap<Key, ByteBuffer> tree = getBufferTree(buffer.isDirect());
       while (true) {
         Key key = new Key(buffer.capacity(), currentGeneration++);
